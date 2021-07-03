@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
+# MIT License
+#
+# Copyright (c) 2021, Christoph Göttschkes
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+# CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+# Everything in this file before the first empty line is used as the help text.
+# Lines, which don't have two space (but other characters) after the # are removed.
+#
+#  NAME
+#      populate-gdb-build-id - Populate the GDB debug-file-directory using build-ids.
+#
+#  SYNOPSIS
+#      populate-gdb-build-id [-k] [-cml] [-v] [-h] debug-file-directory debug-files...
+#
+#  DESCRIPTION
+#      For each given debug-file, inspect its build-id using the readelf tool
+#      and populate GDBs .build-id directory in the given debug-file-directory
+#      with the debug information.
+#
+#      By default, the .build-id directory will be cleaned prior to populating it.
+#      This way, one can always execute the same command once after every re-deploy
+#      of the software without the need to manually handle the debug-file-directory
+#      ever.
+#
+#      By default, populate-gdb-build-id only creates symbolic links to the
+#      given debug-files. If the -c option is given, the debug files will be copied,
+#      or, with the -m option, moved.
+#
+#      To use the debug files inside GDB, use the "set debug-file-directory" command
+#      with the same path as given to populate-gdb-build-id.
+#
+#      See the GDB documentation about "Debugging Information in Separate Files"
+#      for more information about the .build-id directory and the debug-file-directory
+#      setting.
+#
+#  OPTIONS
+#      -k, --keep
+#             Keep contents of the .build-id file intact and only add new files.
+#             If required, old files will be overridden.
+#
+#      -c, --copy
+#             Copy the debug files into the .build-id directory.
+#
+#      -m, --move
+#             Move the debug files into the .build-id directory.
+#
+#      -l, --link
+#             Create a symbolic link to the debug files in the .build-id directory.
+#
+#      -v, --verbose
+#             Be verbose during operation.
+#
+#      -h, --help
+#             Display this help and exit.
+#
+#  EXAMPLES
+#      Populate for a whole project, using extended globs of the shell
+#
+#          $ populate-gdb-build-id /tmp/dbg /path/to/project/**/*.debug
+#
+#      Populate for a whole project, using find and xargs
+#
+#          $ find /path/to/project -name '*.debug' -print0 |xargs -0 populate-gdb-build-id /tmp/dbg
+#
+#      The files containing the debug information do not have to have the debug file extension.
+#      GDB documents this to be the usual file extension for debugging information.
+#
+
+: "${BASH_SOURCE?variable not defined, not running in bash?}"
+
+set -o errexit -o noclobber -o nounset -o pipefail
+unset CDPATH
+IFS=$' \t\n'
+
+declare -g OPERATION='link'
+declare -g -i VERBOSE=0
+declare -g -i CLEAN=1
+declare -g DEBUG_FILE_DIRECTORY=''
+declare -g -a BUILD_IDS=()
+declare -g -a DEBUG_FILES=()
+
+print_usage() {
+    # find the SYNOPSIS line in the help, and print the following line with all
+    # white space characters removed, and usage prepended
+    print_help \
+        |sed -n -e 's/^[[:space:]]*//g ; /^SYNOPSIS$/{n ; s/^[[:space:]]*/usage: / ; p ; q ;}'
+}
+
+print_help() {
+    # remove the first line (shebang)
+    # as soon as we hit a line that doesn't start with #, stop processing
+    # if a line starts with hash, then a space and then a non-space, delete the line
+    # Remove hashes from each line which only contains a hash
+    # Remove # space space from the beginning of each line
+    # print the result
+    sed -n -e '1d ; /^[^#]*$/q ; /^#[[:space:]][^[:space:]]/d ; s/^#$// ; s/^#[[:space:]][[:space:]]// ; p' -- "$0" \
+        |sed -e '/./,$!d' # remove all empty lines at the beginning
+}
+
+# shellcheck disable=SC2059
+warn() {
+    >&2 printf -- '%s: ' "$(basename -- "$0")"
+    >&2 printf -- "$@"
+}
+
+err() {
+    warn "$@"
+    exit 1
+}
+
+read_build_id() {
+    file="$1"
+    if ! readelf -n -- "$file" 2>/dev/null; then
+        return 1
+    fi | awk '/^\s+Build ID:\s+[0-9a-zA-Z]+$/ { print $NF }'
+}
+
+arguments() {
+    params="$(getopt --options 'kcmlvh' \
+                   --longoptions 'keep,copy,move,link,verbose,help' \
+                   --name "$(basename -- "$0")" -- "$@")"
+
+    # shellcheck disable=SC2181
+    if [[ "$?" -ne 0 ]]; then
+        >&2 print_usage
+        exit 1
+    fi
+
+    eval set -- "$params"
+    unset params
+
+    while [[ "$1" != '--' ]]; do
+        case "$1" in
+        -h | --help) >&1 print_help ; exit 0 ;;
+        -v | --verbose) VERBOSE=1 ; shift ;;
+        -k | --keep) CLEAN=0 ; shift ;;
+        -m | --move) OPERATION='move' ; shift ;;
+        -l | --link) OPERATION='link' ; shift ;;
+        -c | --copy) OPERATION='copy' ; shift ;;
+        *) >&2 print_usage ; exit 1 ;;
+        esac
+    done ; shift # remove the --
+
+    if [[ "$#" -eq 0 ]]; then
+        warn '%s\n' 'missing operand'
+        >&2 print_usage
+        exit 1
+    fi
+    DEBUG_FILE_DIRECTORY="$1"
+    shift
+    if [[ "$#" -eq 0 ]]; then
+        warn '%s\n' 'missing operand'
+        >&2 print_usage
+        exit 1
+    fi
+    DEBUG_FILES=( "$@" )
+    shift "$#"
+}
+
+main() {
+    arguments "$@"
+
+    rmflags='-f'
+    mkdirflags='-p'
+    lnflags='-s'
+    mvflags='-f'
+    cpflags='-fa'
+    if [[ "$VERBOSE" -eq 1 ]]; then
+        rmflags+='v'
+        mkdirflags+='v'
+        lnflags+='v'
+        mvflags+='v'
+        cpflags+='v'
+    fi
+
+    if [[ ! -e "${DEBUG_FILE_DIRECTORY}" ]]; then
+        err '%s: No such file or directory\n' "${DEBUG_FILE_DIRECTORY}"
+    fi
+
+    # check the debug-files and populate BUILD_IDS with their build-ids
+    for idx in "${!DEBUG_FILES[@]}"; do
+        debug_file="${DEBUG_FILES[$idx]}"
+        if [[ ! -e "${debug_file}" ]]; then
+            err '%s: No such file or directory\n' "${debug_file}"
+        fi
+        if ! build_id="$(read_build_id "${debug_file}")"; then
+            err '%s: Failed to read build-id\n' "${debug_file}"
+        fi
+        if [[ "x${build_id}" == "x" ]]; then
+            err '%s: no build-id found \n' "${debug_file}"
+        fi
+        if [[ "${#build_id}" -lt 3 ]]; then
+            err '%s: %s: build-id looks incorrect\n' "${debug_file}" "${build_id}"
+        fi
+        debug_file="$(realpath -s -- "${debug_file}")"
+        DEBUG_FILES[$idx]="${debug_file}"
+        BUILD_IDS+=( "${build_id}" )
+    done
+
+    # cleanup .build-id and create it, if required
+    BUILD_ID_DIRECTORY="${DEBUG_FILE_DIRECTORY}/.build-id"
+    if [[ -d "${BUILD_ID_DIRECTORY}" ]] && [[ "${CLEAN}" -eq 1 ]]; then
+        rm -r "${rmflags}" -- "${BUILD_ID_DIRECTORY}"
+    fi
+    mkdir "${mkdirflags}" -- "${BUILD_ID_DIRECTORY}"
+
+    # link,copy,move the debug information into .build-id
+    for idx in "${!BUILD_IDS[@]}"; do
+        build_id="${BUILD_IDS[$idx]}"
+        debug_file="${DEBUG_FILES[$idx]}"
+        prefix="${build_id:0:2}"
+        suffix="${build_id:2}"
+        prefix_dir="${BUILD_ID_DIRECTORY}/${prefix}"
+        target="${prefix_dir}/${suffix}.debug"
+        if [[ ! -d "${prefix_dir}" ]]; then
+            mkdir "${mkdirflags}" -- "${prefix_dir}"
+        fi
+        if [[ -e "${target}" ]]; then
+            rm "${rmflags}" -- "${target}"
+        fi
+        case "${OPERATION}" in
+        'copy')
+            cp "${cpflags}" -- "${debug_file}" "${prefix_dir}/${suffix}.debug"
+            ;;
+        'move')
+            mv "${mvflags}" -- "${debug_file}" "${prefix_dir}/${suffix}.debug"
+            ;;
+        'link')
+            ln "${lnflags}" -- "${debug_file}" "${prefix_dir}/${suffix}.debug"
+            ;;
+        *)
+            err '%s: unknown operation\n' "$OPERATION"
+            ;;
+        esac
+    done
+}
+
+main "$@"
