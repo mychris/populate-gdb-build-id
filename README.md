@@ -22,6 +22,6 @@ See the help of the utility for more information.
 
 ## Copyright
 
-Copyright © 2021, Christoph Göttschkes.
+Copyright © 2021-2022, Christoph Göttschkes.
 
 Released under MIT license.
